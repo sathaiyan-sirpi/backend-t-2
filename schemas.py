@@ -27,6 +27,13 @@ class AntigravityDeviceResponse(AntigravityDeviceBase):
     class Config:
         from_attributes = True
 
+
+class AntigravityDeviceListResponse(BaseModel):
+    total: int
+    skip: int
+    limit: int
+    items: List[AntigravityDeviceResponse]
+
 # --- User Schemas ---
 class UserBase(BaseModel):
     email: EmailStr

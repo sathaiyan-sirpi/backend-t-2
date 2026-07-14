@@ -1,8 +1,12 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+# pyrefly: ignore [missing-import]
+from fastapi import FastAPI, Depends, HTTPException, status, Query
+# pyrefly: ignore [missing-import]
 from fastapi.security import OAuth2PasswordRequestForm
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 from datetime import timedelta
-from typing import List
+from typing import List, Optional
+from sqlalchemy import or_, desc, asc
 
 import models, schemas, auth
 from database import engine, get_db
@@ -61,12 +65,81 @@ def read_user_devices(
 ):
     return current_user.devices
 
-@app.get("/devices/", response_model=List[schemas.AntigravityDeviceResponse])
-def read_devices(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    # This might be an admin route or open to all. The prompt doesn't strictly say to protect GET /devices/.
-    # But usually GET all is allowed. I'll leave it open, but /users/me/devices gets only user's.
-    devices = db.query(models.AntigravityDevice).offset(skip).limit(limit).all()
-    return devices
+@app.get("/devices/", response_model=schemas.AntigravityDeviceListResponse)
+def read_devices(
+    category: Optional[str] = Query(None, description="Exact match category filter"),
+    min_price: Optional[float] = Query(None, ge=0, description="Minimum price (>=)"),
+    max_price: Optional[float] = Query(None, ge=0, description="Maximum price (<=)"),
+    search: Optional[str] = Query(None, description="Search text (partial, case-insensitive)"),
+    sort_by: Optional[str] = Query(None, description="Sort field: price or created_at"),
+    order: str = Query("desc", regex="^(asc|desc)$", description="Sort order: asc or desc"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=0, le=100),
+    db: Session = Depends(get_db)
+):
+    """
+    Read devices with advanced querying: filtering, search, sorting, and pagination.
+
+    Execution order: filtering -> search -> sorting -> pagination
+    """
+
+    query = db.query(models.AntigravityDevice)
+
+    # --- Filtering ---
+    # category: exact match if field exists
+    if category and hasattr(models.AntigravityDevice, "category"):
+        query = query.filter(models.AntigravityDevice.category == category)
+
+    # Determine a numeric 'price' field fallback if real 'price' not present
+    price_column = None
+    if hasattr(models.AntigravityDevice, "price"):
+        price_column = models.AntigravityDevice.price
+    elif hasattr(models.AntigravityDevice, "max_altitude"):
+        # fallback mapping: treat max_altitude as 'price' for this project
+        price_column = models.AntigravityDevice.max_altitude
+    elif hasattr(models.AntigravityDevice, "core_stability"):
+        price_column = models.AntigravityDevice.core_stability
+
+    if min_price is not None and price_column is not None:
+        query = query.filter(price_column >= min_price)
+    if max_price is not None and price_column is not None:
+        query = query.filter(price_column <= max_price)
+
+    # --- Search ---
+    # Detect which text fields exist on the model
+    text_fields = [f for f in ("name", "title", "description") if hasattr(models.AntigravityDevice, f)]
+    if search and text_fields:
+        search_term = f"%{search}%"
+        search_clauses = [getattr(models.AntigravityDevice, f).ilike(search_term) for f in text_fields]
+        query = query.filter(or_(*search_clauses))
+
+    # --- Sorting ---
+    # Allowed sort keys mapped to actual model columns to avoid SQL injection
+    allowed_sort_map = {
+        "price": price_column,
+        "created_at": getattr(models.AntigravityDevice, "created_at", None),
+    }
+
+    if sort_by:
+        if sort_by not in allowed_sort_map or allowed_sort_map.get(sort_by) is None:
+            raise HTTPException(status_code=422, detail="Invalid sort_by field.")
+        sort_col = allowed_sort_map[sort_by]
+        if order == "asc":
+            query = query.order_by(asc(sort_col))
+        else:
+            query = query.order_by(desc(sort_col))
+    else:
+        # default sort by created_at desc if available
+        if hasattr(models.AntigravityDevice, "created_at"):
+            query = query.order_by(desc(models.AntigravityDevice.created_at))
+
+    # --- Total count BEFORE pagination ---
+    total = query.count()
+
+    # --- Pagination ---
+    results = query.offset(skip).limit(limit).all()
+
+    return {"total": total, "skip": skip, "limit": limit, "items": results}
 
 @app.put("/devices/{id}", response_model=schemas.AntigravityDeviceResponse)
 def update_device(
